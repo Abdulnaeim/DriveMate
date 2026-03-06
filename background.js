@@ -117,14 +117,24 @@ chrome.debugger.onEvent.addListener((debuggeeId, method, params) => {
     if (!extensionEnabled && !pendingTabs.has(tabId)) return;
 
     if (method === "Network.requestWillBeSent") {
-        if (params.request.url.startsWith("https://workspacevideo-pa.clients6.google.com")) {
+        // Google sometimes serves the video metadata from various clients servers
+        // (clients2, clients4, etc.).  Matching on the base host was too narrow –
+        // we only captured `clients6` which meant requests from other regions were
+        // ignored.  We also widen the filter to any request containing
+        // "workspacevideo" and treat XHR/Fetch traffic as potential candidates.
+        const url = params.request.url || "";
+        const isWorkspaceVideo = /https:\/\/workspacevideo(?:-pa)?\.clients\d+\.google\.com/.test(url) || url.includes("workspacevideo");
+        const isXHR = params.type === "XHR" || params.type === "Fetch";
+        if (isWorkspaceVideo || isXHR) {
             const requestId = params.requestId;
             capturedRequests[requestId] = {
-                url: params.request.url,
+                url: url,
                 method: params.request.method,
                 timestamp: params.timestamp,
                 tabId: tabId
             };
+            // debug log to help diagnose missing streams
+            console.log("capturing request", requestId, url, "type", params.type);
         }
     } else if (method === "Network.responseReceived") {
         const requestId = params.requestId;
@@ -138,15 +148,41 @@ chrome.debugger.onEvent.addListener((debuggeeId, method, params) => {
                     capturedRequests[requestId].responseBody = result.body;
                     capturedRequests[requestId].base64Encoded = result.base64Encoded;
                     try {
-                        const data = JSON.parse(result.body);
-                        if (data.mediaStreamingData?.formatStreamingData?.progressiveTranscodes) {
-                            const transcodes = data.mediaStreamingData.formatStreamingData.progressiveTranscodes;
+                        let body = result.body;
+                        if (result.base64Encoded) {
+                            body = atob(body);
+                        }
+                        const data = JSON.parse(body);
+
+                        // try known structured locations
+                        let transcodes = null;
+                        if (data.mediaStreamingData?.formatStreamingData?.progressiveTranscodes && data.mediaStreamingData.formatStreamingData.progressiveTranscodes.length > 0) {
+                            transcodes = data.mediaStreamingData.formatStreamingData.progressiveTranscodes;
+                        } else if (data.mediaStreamingData?.formatStreamingData?.adaptiveFormats && data.mediaStreamingData.formatStreamingData.adaptiveFormats.length > 0) {
+                            transcodes = data.mediaStreamingData.formatStreamingData.adaptiveFormats;
+                        }
+                        if (transcodes) {
                             capturedRequests[requestId].lastItagUrl = transcodes[transcodes.length - 1]?.url;
+                        }
+
+                        // fallback: scan for any itag-containing URL in the raw body
+                        if (!capturedRequests[requestId].lastItagUrl) {
+                            const regex = /https?:\\\/\\\/[^"']+itag=[0-9]+/g;
+                            let match;
+                            while ((match = regex.exec(body))) {
+                                capturedRequests[requestId].lastItagUrl = match[0].replace(/\\\\\//g, "/");
+                                break;
+                            }
+                        }
+                        if (!capturedRequests[requestId].lastItagUrl) {
+                            console.warn("no video URL extracted for request", requestId, capturedRequests[requestId].url);
                         }
                         if (data.mediaMetadata?.title) {
                             capturedRequests[requestId].videoTitle = data.mediaMetadata.title;
                         }
-                    } catch (e) { }
+                    } catch (e) {
+                        console.log("Failed to parse response body:", e);
+                    }
                 }
             );
         }
